@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS addons (
     date_released       TEXT,
     date_modified       TEXT,
     allow_distribution  INTEGER,
+    logo_url            TEXT,                      -- media.forgecdn.net thumbnail
     first_seen_run      INTEGER REFERENCES runs(id),
     last_seen_run       INTEGER REFERENCES runs(id)
 );
@@ -125,7 +126,18 @@ def connect(path=DEFAULT_DB):
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn):
+    """Add columns to an existing database without losing its data.
+    CREATE TABLE IF NOT EXISTS won't alter a table that already exists."""
+    have = {r[1] for r in conn.execute("PRAGMA table_info(addons)")}
+    for col, decl in [("logo_url", "TEXT")]:
+        if col not in have:
+            conn.execute(f"ALTER TABLE addons ADD COLUMN {col} {decl}")
+    conn.commit()
 
 
 # ----------------------------------------------------------------- runs
@@ -194,8 +206,8 @@ def save_addon(conn, run_id, mod):
                id, slug, name, summary, class_id, primary_category_id,
                author_id, author_name, website_url, source_url, issues_url,
                date_created, date_released, date_modified, allow_distribution,
-               first_seen_run, last_seen_run)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               logo_url, first_seen_run, last_seen_run)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(id) DO UPDATE SET
                slug=excluded.slug, name=excluded.name, summary=excluded.summary,
                class_id=excluded.class_id,
@@ -207,6 +219,7 @@ def save_addon(conn, run_id, mod):
                date_released=excluded.date_released,
                date_modified=excluded.date_modified,
                allow_distribution=excluded.allow_distribution,
+               logo_url=excluded.logo_url,
                last_seen_run=excluded.last_seen_run""",
         (
             mod.get("id"), mod.get("slug"), mod.get("name"), mod.get("summary"),
@@ -215,6 +228,7 @@ def save_addon(conn, run_id, mod):
             links.get("websiteUrl"), links.get("sourceUrl"), links.get("issuesUrl"),
             mod.get("dateCreated"), mod.get("dateReleased"), mod.get("dateModified"),
             1 if mod.get("allowModDistribution") else 0,
+            (mod.get("logo") or {}).get("thumbnailUrl"),
             run_id, run_id,
         ),
     )
