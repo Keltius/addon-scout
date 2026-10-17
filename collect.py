@@ -78,6 +78,7 @@ def process_mod(conn, run_id, cf, mod, taken_at, full_files):
         is_forever, is_multi = db.save_file(
             conn, run_id, addon_id, f, api.FOREVER_TYPE_ID, taken_at
         )
+        db.save_dependencies(conn, run_id, addon_id, f)
         if is_forever:
             n_forever += 1
             dl_any += f.get("downloadCount") or 0

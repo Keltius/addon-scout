@@ -76,6 +76,37 @@ CREATE TABLE IF NOT EXISTS files (
     first_seen_run   INTEGER REFERENCES runs(id)
 );
 
+-- Declared relationships between addons, straight from each file's
+-- `dependencies` array. Free: we already fetch it and were discarding it.
+-- depends_on_id has no FK — it often points at an addon outside the Forever
+-- set (a Retail-only library, say), which we never collect.
+CREATE TABLE IF NOT EXISTS dependencies (
+    addon_id       INTEGER NOT NULL REFERENCES addons(id),
+    depends_on_id  INTEGER NOT NULL,
+    relation_type  INTEGER NOT NULL,   -- 1 lib 2 optional 3 required 4 tool 5 incompatible 6 include
+    first_seen_run INTEGER,
+    last_seen_run  INTEGER,
+    PRIMARY KEY (addon_id, depends_on_id, relation_type)
+);
+
+-- ===================== HAND-CURATED — THE COLLECTOR NEVER WRITES HERE =====
+-- For relationships no API field expresses: addons that compete with each
+-- other rather than depend on each other (Node Sight / Lueur / Forever Loot
+-- Sparkles all light up gathering nodes, and none declares any link to the
+-- others). Edit these by hand in SQLiteStudio.
+CREATE TABLE IF NOT EXISTS curated_groups (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,         -- e.g. "Gathering node highlighters"
+    note TEXT
+);
+CREATE TABLE IF NOT EXISTS curated_group_members (
+    group_id INTEGER NOT NULL REFERENCES curated_groups(id),
+    addon_id INTEGER NOT NULL,
+    note     TEXT,
+    PRIMARY KEY (group_id, addon_id)
+);
+-- ==========================================================================
+
 -- One row per addon per run. The time series that makes velocity possible.
 CREATE TABLE IF NOT EXISTS snapshots (
     run_id   INTEGER NOT NULL REFERENCES runs(id),
@@ -113,6 +144,7 @@ CREATE INDEX IF NOT EXISTS idx_snap_addon  ON snapshots(addon_id, taken_at);
 CREATE INDEX IF NOT EXISTS idx_fsnap_file  ON file_snapshots(file_id, taken_at);
 CREATE INDEX IF NOT EXISTS idx_files_addon ON files(addon_id);
 CREATE INDEX IF NOT EXISTS idx_addons_slug ON addons(slug);
+CREATE INDEX IF NOT EXISTS idx_deps_target  ON dependencies(depends_on_id);
 """
 
 
@@ -279,6 +311,28 @@ def save_file(conn, run_id, addon_id, f, forever_type_id, taken_at):
         (run_id, f.get("id"), taken_at, f.get("downloadCount")),
     )
     return is_forever, is_multi
+
+
+def save_dependencies(conn, run_id, addon_id, f):
+    """Record what this file declares it needs. Upsert, never delete: an
+    author dropping a dependency shouldn't erase that it once existed."""
+    deps = f.get("dependencies") or []
+    if not deps:
+        return 0
+    rows = [
+        (addon_id, d.get("modId"), d.get("relationType"), run_id, run_id)
+        for d in deps
+        if d.get("modId") and d.get("relationType")
+    ]
+    conn.executemany(
+        """INSERT INTO dependencies
+               (addon_id, depends_on_id, relation_type, first_seen_run, last_seen_run)
+           VALUES (?,?,?,?,?)
+           ON CONFLICT(addon_id, depends_on_id, relation_type)
+           DO UPDATE SET last_seen_run = excluded.last_seen_run""",
+        rows,
+    )
+    return len(rows)
 
 
 def save_snapshot(conn, run_id, addon_id, taken_at, mod, stats):

@@ -103,6 +103,55 @@ def bar_rows(rows, value_key, label_fmt, accent=ACCENT,
     return f'<ol class="bars">{"".join(out)}</ol>'
 
 
+def family_map(conn):
+    """addon_id -> family root, via declared RequiredDependency (type 3).
+
+    Resolves one hop up, then collapses chains, so a module of a module lands
+    on the same root. Only edges pointing at an addon we actually track count;
+    a dependency on some Retail-only library is not a family.
+    """
+    parent = {}
+    for r in q(conn, """SELECT d.addon_id, d.depends_on_id FROM dependencies d
+                        JOIN addons a ON a.id = d.depends_on_id
+                        WHERE d.relation_type = 3"""):
+        parent.setdefault(r["addon_id"], r["depends_on_id"])
+
+    def root(aid, depth=0):
+        p = parent.get(aid)
+        if p is None or p == aid or depth > 4:
+            return aid
+        return root(p, depth + 1)
+
+    return {aid: root(aid) for aid in parent}
+
+
+def pick(rows, seen, fams, limit=10, per_author=1, per_family=1):
+    """Thin a ranked list before display.
+
+    Three separate problems, all of which showed up in real reports:
+      - one author taking 3 of 10 slots (rustykey's language packs)
+      - a family taking several slots (DBM-Core beside DBM-Dungeons)
+      - the same addon appearing in three different cards
+    `seen` is shared across cards, so earlier cards win.
+    """
+    out, authors, families = [], {}, {}
+    for r in rows:
+        aid = r["addon_id"]
+        if aid in seen:
+            continue
+        au = r["author_name"] or f"?{aid}"
+        fam = fams.get(aid, aid)
+        if authors.get(au, 0) >= per_author or families.get(fam, 0) >= per_family:
+            continue
+        authors[au] = authors.get(au, 0) + 1
+        families[fam] = families.get(fam, 0) + 1
+        out.append(r)
+        seen.add(aid)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def card(title, subtitle, body):
     return f"""
     <section class="card">
@@ -125,10 +174,14 @@ def build(conn, days):
     # nonsense like "+5,062 new addons".
     full = [r for r in runs[1:] if r["addons_seen"] >= 0.9 * cur["addons_seen"]]
     prev = None
+    # Fractional days with slack: a scheduled run that fires 23h58m after the
+    # last one is still "yesterday". Integer .days silently skipped a day and
+    # produced a 2-day window labelled as one.
+    want = max(days - 0.25, 0)
     for r in full:
         gap = (datetime.fromisoformat(cur["started_at"])
-               - datetime.fromisoformat(r["started_at"])).days
-        if gap >= days:
+               - datetime.fromisoformat(r["started_at"])).total_seconds() / 86400
+        if gap >= want:
             prev = r
             break
     if prev is None and full:
@@ -143,6 +196,8 @@ def build(conn, days):
                   (run_id,))[0]["n"] if prev else 0
 
     cards = []
+    fams = family_map(conn)
+    seen = set()
 
     # --- Rising: biggest download gains -----------------------------------
     if prev:
@@ -151,66 +206,142 @@ def build(conn, days):
         span = (f"{secs / 86400:.1f} days" if secs >= 86400
                 else f"{secs / 3600:.1f} hours")
         rising = q(conn, """
-            SELECT ad.name, ad.slug, ad.author_name, ad.summary, ad.logo_url, a.tier,
+            SELECT ad.id AS addon_id, ad.name, ad.slug, ad.author_name, ad.summary,
+                   ad.logo_url, a.tier,
                    a.project_downloads - b.project_downloads AS gain
             FROM snapshots a
             JOIN snapshots b ON b.addon_id = a.addon_id AND b.run_id = ?
             JOIN addons ad ON ad.id = a.addon_id
             WHERE a.run_id = ? AND gain > 0
-            ORDER BY gain DESC LIMIT 10""", (prev["id"], run_id))
+            ORDER BY gain DESC LIMIT 80""", (prev["id"], run_id))
         cards.append(card(
-            "📈 Biggest movers",
-            f"Downloads gained over the last {span}",
-            bar_rows(rising, "gain", lambda v: f"+{v:,}")))
+            "🔥 Most downloaded today",
+            f"Raw downloads gained over the last {span} — the giants win this one. One per author, one per addon family.",
+            bar_rows(pick(rising, seen, fams), "gain", lambda v: f"+{v:,}")))
+
+        # Absolute gain just re-ranks by size: Details! gaining 345k on a base
+        # of 370M is 0.09% growth. Rate is the momentum question. The floor
+        # keeps 2 -> 20 downloads off the leaderboard.
+        FLOOR = 500
+        fast = q(conn, """
+            SELECT ad.id AS addon_id, ad.name, ad.slug, ad.author_name, ad.summary,
+                   ad.logo_url, ad.date_created, a.tier,
+                   1.0 * (a.project_downloads - b.project_downloads)
+                       / b.project_downloads AS rate
+            FROM snapshots a
+            JOIN snapshots b ON b.addon_id = a.addon_id AND b.run_id = ?
+            JOIN addons ad ON ad.id = a.addon_id
+            WHERE a.run_id = ? AND b.project_downloads >= ?
+              AND a.project_downloads > b.project_downloads
+            ORDER BY rate DESC LIMIT 80""", (prev["id"], run_id, FLOOR))
+        cards.append(card(
+            "🚀 Fastest growing",
+            f"% growth over the same window ({FLOOR}+ downloads already, so "
+            "tiny numbers can't game it)",
+            bar_rows(pick(fast, seen, fams), "rate", lambda v: f"+{v:.0%}" if v >= 0.1
+                     else f"+{v*100:.1f}%")))
 
         gems = q(conn, """
-            SELECT ad.name, ad.slug, ad.author_name, ad.summary, ad.logo_url,
-                   ad.date_created, a.tier,
+            SELECT ad.id AS addon_id, ad.name, ad.slug, ad.author_name, ad.summary,
+                   ad.logo_url, ad.date_created, a.tier,
                    a.project_downloads - b.project_downloads AS gain
             FROM snapshots a
             JOIN snapshots b ON b.addon_id = a.addon_id AND b.run_id = ?
             JOIN addons ad ON ad.id = a.addon_id
             WHERE a.run_id = ? AND a.tier = 'native'
               AND a.project_downloads < 20000 AND gain > 0
-            ORDER BY gain DESC LIMIT 10""", (prev["id"], run_id))
+            ORDER BY gain DESC LIMIT 80""", (prev["id"], run_id))
         cards.append(card(
             "💎 Hidden gems",
             "Under 20k lifetime downloads, but growing fastest right now",
-            bar_rows(gems, "gain", lambda v: f"+{v:,}", ACCENT_2)))
+            bar_rows(pick(gems, seen, fams), "gain", lambda v: f"+{v:,}", ACCENT_2)))
     else:
         cards.append(card(
             "📈 Biggest movers",
             "Needs two collector runs — growth can't be measured from one snapshot",
             '<p class="empty">Run collect.py again tomorrow and this fills in.</p>'))
 
+    # --- Families: the payoff for storing dependencies --------------------
+    if prev:
+        gains = q(conn, """
+            SELECT ad.id AS addon_id, ad.name, ad.slug, ad.author_name,
+                   ad.logo_url,
+                   a.project_downloads - b.project_downloads AS gain
+            FROM snapshots a
+            JOIN snapshots b ON b.addon_id = a.addon_id AND b.run_id = ?
+            JOIN addons ad ON ad.id = a.addon_id
+            WHERE a.run_id = ? AND a.project_downloads > b.project_downloads""",
+            (prev["id"], run_id))
+
+        roots = {}
+        for r in gains:
+            root = fams.get(r["addon_id"], r["addon_id"])
+            f = roots.setdefault(root, {"gain": 0, "n": 0, "head": None,
+                                        "authors": []})
+            f["gain"] += r["gain"] or 0
+            f["n"] += 1
+            f["authors"].append(r["author_name"])
+            if r["addon_id"] == root:
+                f["head"] = r
+
+        fam_rows = []
+        for root, f in roots.items():
+            # A "family" needs the parent plus at least two satellites, and we
+            # need the parent's own row for a name and logo.
+            if f["n"] < 3 or not f["head"]:
+                continue
+            h = f["head"]
+            # Only sum a SUITE — one author's own modules. A shared library
+            # (Ace3: 29 dependents, 0 by its author) or a plugin ecosystem
+            # (Questie: 17 dependents, 15 different authors) is not one
+            # product, and adding its members up would be meaningless.
+            same = sum(1 for a in f["authors"] if a and a == h["author_name"])
+            if same * 2 < f["n"]:
+                continue
+            fam_rows.append({
+                "addon_id": root, "name": h["name"], "slug": h["slug"],
+                "author_name": h["author_name"], "logo_url": h["logo_url"],
+                "summary": f"{f['n']} addons in this family moved together",
+                "gain": f["gain"],
+            })
+        fam_rows.sort(key=lambda r: -r["gain"])
+
+        cards.append(card(
+            "\U0001F3DB\uFE0F Hottest families",
+            "One author's module suite, summed. A base's own growth "
+            "understates it — most module installs come from people who "
+            "already had the base. Shared libraries are excluded.",
+            bar_rows(fam_rows[:8], "gain", lambda v: f"+{v:,}", ACCENT_2,
+                     empty="No families with 3+ moving members yet.")))
+
     # --- New arrivals (works from a single snapshot) -----------------------
     newest = q(conn, """
-        SELECT ad.name, ad.slug, ad.author_name, ad.summary, ad.logo_url,
-               ad.date_created, s.project_downloads AS dl
+        SELECT ad.id AS addon_id, ad.name, ad.slug, ad.author_name, ad.summary,
+               ad.logo_url, ad.date_created, s.project_downloads AS dl
         FROM snapshots s JOIN addons ad ON ad.id = s.addon_id
         WHERE s.run_id = ? AND ad.date_created >= date('now', '-14 days')
-        ORDER BY dl DESC LIMIT 10""", (run_id,))
+        ORDER BY dl DESC LIMIT 600""", (run_id,))
     cards.append(card(
         "✨ New arrivals",
         "Projects created in the last 14 days, by downloads so far",
-        bar_rows(newest, "dl", lambda v: f"{v:,}")))
+        bar_rows(pick(newest, seen, fams), "dl", lambda v: f"{v:,}")))
 
     # --- Veterans: stale check -------------------------------------------
     # The download floor matters: without it this fills with tiny addons from
     # one prolific author and calls them "big names".
     FLOOR = 100_000
     stale = q(conn, """
-        SELECT ad.name, ad.slug, ad.author_name, ad.summary, ad.logo_url,
-               s.date_modified, s.project_downloads AS dl
+        SELECT ad.id AS addon_id, ad.name, ad.slug, ad.author_name, ad.summary,
+               ad.logo_url, s.date_modified, s.project_downloads AS dl
         FROM snapshots s JOIN addons ad ON ad.id = s.addon_id
         WHERE s.run_id = ? AND s.tier = 'crossflavor'
           AND s.project_downloads >= ?
           AND s.date_modified < date('now', '-30 days')
-        ORDER BY dl DESC LIMIT 8""", (run_id, FLOOR))
+        ORDER BY dl DESC LIMIT 60""", (run_id, FLOOR))
     cards.append(card(
         "🕰️ Big names going stale",
         f"{FLOOR//1000}k+ downloads, supports Forever, but no update in 30+ days",
-        bar_rows(stale, "dl", lambda v: f"{v:,}", ACCENT_2,
+        bar_rows(pick(stale, seen, fams, limit=8), "dl", lambda v: f"{v:,}", ACCENT_2,
                  empty="None — every big cross-flavor addon has been updated "
                        "in the last 30 days.")))
 
